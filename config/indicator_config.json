@@ -1,0 +1,44 @@
+{
+  "strategies": {
+    "forex_trend_momentum": {
+      "timeframe": "15m",
+      "indicators": [
+        { "type": "ema", "role": "trend", "params": { "fast": 12, "slow": 26 } },
+        { "type": "rsi", "role": "momentum", "params": { "period": 14, "overbought": 70, "oversold": 30 } },
+        { "type": "atr", "id": "atr_stop", "role": "volatility", "params": { "period": 14 } }
+      ],
+      "entry_rules": [
+        { "condition": "ema_fast_crosses_above_ema_slow" },
+        { "condition": "rsi_below", "value": 70 }
+      ],
+      "rule_logic": "all",
+      "stop_loss": {
+        "mode": "atr_dynamic",
+        "atr_source": "atr_stop",
+        "atr_multiplier": 1.5
+      }
+    },
+    "shares_breakout": {
+      "timeframe": "1h",
+      "indicators": [
+        { "type": "bollinger", "params": { "period": 20, "std_dev": 2 } },
+        { "type": "macd", "params": { "fast": 12, "slow": 26, "signal": 9 } }
+      ],
+      "entry_rules": [
+        { "condition": "price_above_upper_band" },
+        { "condition": "macd_bullish_cross" }
+      ],
+      "rule_logic": "all",
+      "stop_loss": { "mode": "fixed_pct", "value": 3.0 }
+    }
+  },
+  "asset_class_defaults": {
+    "forex": "forex_trend_momentum",
+    "shares": "shares_breakout",
+    "indices": null,
+    "commodities": null
+  },
+  "instrument_overrides": {
+    "CS.D.EURUSD.CFD.IP": "forex_trend_momentum"
+  }
+}

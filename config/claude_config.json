@@ -1,0 +1,27 @@
+{
+  "decision_engine": {
+    "enabled": true,
+    "run_on": ["demo", "live"],
+    "news_source": "web_search",
+    "news_lookback_hours": 24,
+    "trade_history_lookback": 20,
+    "min_confidence_to_trade": "medium",
+    "model": "claude-sonnet-4-6"
+  },
+  "live_promotion": {
+    "require_calibration": true,
+    "min_demo_trades": 30,
+    "min_demo_win_rate_pct": 55,
+    "min_demo_days": 14,
+    "manual_override_allowed": true
+  },
+  "post_trade_review": { "enabled": true, "run_on": ["demo", "live"] },
+  "periodic_review": { "enabled": true, "frequency": "daily", "lookback_trades": 50, "run_on": ["live"] },
+  "code_monitor": {
+    "enabled": true,
+    "watch": ["exceptions", "unexpected_order_rejections", "api_errors"],
+    "trigger": "on_error",
+    "notify": "dashboard_alert",
+    "auto_apply_fixes": false
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "enabled_classes": ["forex", "indices"],
+  "instruments": {
+    "forex": ["CS.D.EURUSD.CFD.IP"],
+    "indices": ["IX.D.FTSE.DAILY.IP"],
+    "shares": [],
+    "commodities": []
+  }
+}

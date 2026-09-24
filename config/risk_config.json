@@ -1,0 +1,7 @@
+{
+  "max_total_exposure": 500.00,
+  "max_per_trade": 100.00,
+  "default_stop_loss": { "mode": "fixed_pct", "value": 2.0 },
+  "take_profit_pct": null,
+  "currency": "GBP"
+}

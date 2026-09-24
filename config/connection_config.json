@@ -1,0 +1,15 @@
+{
+  "active_mode": "demo",
+  "demo": {
+    "api_key": "env:IG_DEMO_API_KEY",
+    "username": "env:IG_DEMO_USERNAME",
+    "password": "env:IG_DEMO_PASSWORD",
+    "base_url": "https://demo-api.ig.com"
+  },
+  "live": {
+    "api_key": "env:IG_LIVE_API_KEY",
+    "username": "env:IG_LIVE_USERNAME",
+    "password": "env:IG_LIVE_PASSWORD",
+    "base_url": "https://api.ig.com"
+  }
+}

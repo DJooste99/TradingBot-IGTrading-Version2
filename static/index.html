@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>IG Trading Bot</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">IG Trading Bot</div>
+  <div class="topbar-controls">
+    <span id="mode-badge" class="badge">…</span>
+    <button id="mode-toggle" class="btn">Switch mode</button>
+    <span id="engine-state" class="engine-state">engine: …</span>
+    <button id="engine-toggle" class="btn">Start engine</button>
+  </div>
+</header>
+
+<div id="alert-banner" class="alert hidden"></div>
+
+<nav class="tabs">
+  <button data-tab="overview" class="active">Overview</button>
+  <button data-tab="trades">Trade log</button>
+  <button data-tab="decisions">Claude decisions</button>
+  <button data-tab="reviews">Reviews</button>
+  <button data-tab="bugs">Bug reports <span id="bug-count" class="count hidden"></span></button>
+  <button data-tab="config">Config</button>
+</nav>
+
+<main>
+  <!-- Overview -->
+  <section id="tab-overview" class="tab active">
+    <div class="cards" id="summary-cards"></div>
+    <div class="grid2">
+      <div class="panel">
+        <h2>Open positions</h2>
+        <div id="open-positions"></div>
+      </div>
+      <div class="panel">
+        <h2>Calibration gate (demo → live)</h2>
+        <div id="calibration"></div>
+      </div>
+    </div>
+    <div class="panel">
+      <h2>P/L by strategy</h2>
+      <div id="by-strategy"></div>
+    </div>
+    <div class="panel">
+      <h2>Instruments</h2>
+      <div id="instruments"></div>
+    </div>
+  </section>
+
+  <!-- Trades -->
+  <section id="tab-trades" class="tab">
+    <div class="filters">
+      <label>Mode <select id="f-mode"><option value="">all</option><option>demo</option><option>live</option></select></label>
+      <label>Status <select id="f-status"><option value="">all</option><option>open</option><option>closed</option>
+        <option>skipped</option><option>rejected_risk</option><option>rejected_broker</option><option>error</option></select></label>
+      <button class="btn" id="f-refresh">Refresh</button>
+    </div>
+    <div id="trades-table"></div>
+  </section>
+
+  <!-- Claude decisions -->
+  <section id="tab-decisions" class="tab">
+    <div class="panel">
+      <h2>Strategy suggestion vs Claude's final call</h2>
+      <p class="muted">Rows where the strategy wanted in and Claude said no are the key test of whether news-based judgment adds value.</p>
+      <div id="decision-matrix"></div>
+    </div>
+    <div class="panel">
+      <h2>Signals Claude skipped</h2>
+      <div id="skipped-table"></div>
+    </div>
+  </section>
+
+  <!-- Reviews -->
+  <section id="tab-reviews" class="tab">
+    <div class="filters"><button class="btn" id="run-review">Run periodic review now</button></div>
+    <div id="reviews-list"></div>
+  </section>
+
+  <!-- Bugs -->
+  <section id="tab-bugs" class="tab">
+    <div class="filters">
+      <label>Status <select id="b-status"><option value="">all</option><option selected>unreviewed</option>
+        <option>acknowledged</option><option>fixed</option><option>dismissed</option></select></label>
+    </div>
+    <p class="muted">Claude diagnoses and suggests. Nothing is patched automatically; review and apply fixes yourself.</p>
+    <div id="bugs-list"></div>
+  </section>
+
+  <!-- Config -->
+  <section id="tab-config" class="tab">
+    <div class="panel">
+      <h2>Asset classes</h2>
+      <div id="asset-toggles" class="toggles"></div>
+    </div>
+    <div class="panel">
+      <h2>Config files</h2>
+      <div class="filters">
+        <select id="cfg-name">
+          <option value="indicator">indicator_config.json</option>
+          <option value="risk">risk_config.json</option>
+          <option value="asset">asset_config.json</option>
+          <option value="claude">claude_config.json</option>
+          <option value="connection">connection_config.json (read-only)</option>
+        </select>
+        <button class="btn" id="cfg-save">Validate &amp; save</button>
+        <span id="cfg-msg" class="muted"></span>
+      </div>
+      <textarea id="cfg-editor" spellcheck="false"></textarea>
+    </div>
+  </section>
+</main>
+
+<!-- Mode switch modal -->
+<div id="modal" class="modal hidden" role="dialog" aria-modal="true">
+  <div class="modal-box">
+    <h2 id="modal-title">Switch mode</h2>
+    <div id="modal-body"></div>
+    <div class="modal-actions">
+      <button class="btn" id="modal-cancel">Cancel</button>
+      <button class="btn danger" id="modal-confirm">Confirm switch</button>
+    </div>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
