@@ -147,11 +147,11 @@ def warmup_bars(indicator_specs) -> int:
     """Rough number of candles needed before every indicator is stable."""
     longest = 1
     for spec in indicator_specs:
-        for v in spec.params.values():
-            if isinstance(v, (int, float)) and not isinstance(v, bool) and v < 500:
-                longest = max(longest, int(v))
-    if any(s.type == "macd" for s in indicator_specs):
-        p = next(s.params for s in indicator_specs if s.type == "macd")
-        longest = max(longest, int(p.get("slow", 26)) + int(p.get("signal", 9)))
-    # EMA/Wilder smoothing needs several multiples of the period to converge
-    return max(60, longest * 4)
+        p = spec.params
+        # only look-back lengths count; thresholds like RSI overbought=70 are not periods
+        lengths = [int(p[k]) for k in ("period", "fast", "slow") if isinstance(p.get(k), (int, float))]
+        if spec.type == "macd":
+            lengths.append(int(p.get("slow", 26)) + int(p.get("signal", 9)))
+        longest = max([longest, *lengths])
+    # EMA/Wilder smoothing needs a few multiples of the period to converge
+    return max(60, longest * 3)

@@ -69,6 +69,22 @@ CREATE TABLE IF NOT EXISTS claude_bug_reports (
     claude_suggested_fix TEXT,
     status TEXT DEFAULT 'unreviewed'
 );
+
+CREATE TABLE IF NOT EXISTS kv (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+-- persisted candles, so restarts don't re-spend IG's historical data allowance
+CREATE TABLE IF NOT EXISTS candles (
+    mode TEXT NOT NULL,
+    epic TEXT NOT NULL,
+    resolution TEXT NOT NULL,
+    time TEXT NOT NULL,
+    open REAL NOT NULL, high REAL NOT NULL, low REAL NOT NULL, close REAL NOT NULL,
+    volume REAL,
+    PRIMARY KEY (mode, epic, resolution, time)
+);
 """
 
 TRADE_JSON_FIELDS = ("stop_loss_used", "indicators_used")
@@ -308,3 +324,40 @@ def list_bug_reports(status: Optional[str] = None, limit: int = 100) -> list[dic
 def count_unreviewed_bugs() -> int:
     with connect() as conn:
         return conn.execute("SELECT COUNT(*) FROM claude_bug_reports WHERE status = 'unreviewed'").fetchone()[0]
+
+
+# ---------------------------------------------------------------- kv
+def kv_get(key: str) -> Optional[Any]:
+    with connect() as conn:
+        r = conn.execute("SELECT value FROM kv WHERE key = ?", (key,)).fetchone()
+    return json.loads(r[0]) if r else None
+
+
+def kv_set(key: str, value: Any) -> None:
+    with connect() as conn:
+        conn.execute("INSERT INTO kv (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                     (key, json.dumps(value)))
+
+
+# ---------------------------------------------------------------- candles
+def load_candles(mode: str, epic: str, resolution: str, limit: int) -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT time, open, high, low, close, volume FROM candles
+               WHERE mode = ? AND epic = ? AND resolution = ? ORDER BY time DESC LIMIT ?""",
+            (mode, epic, resolution, limit)).fetchall()
+    return [dict(r) for r in reversed(rows)]
+
+
+def save_candles(mode: str, epic: str, resolution: str, candles: list[dict], keep: int) -> None:
+    with connect() as conn:
+        conn.executemany(
+            """INSERT OR REPLACE INTO candles (mode, epic, resolution, time, open, high, low, close, volume)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            [(mode, epic, resolution, c["time"], c["open"], c["high"], c["low"], c["close"], c.get("volume"))
+             for c in candles])
+        conn.execute(
+            """DELETE FROM candles WHERE mode = ? AND epic = ? AND resolution = ? AND time NOT IN (
+                 SELECT time FROM candles WHERE mode = ? AND epic = ? AND resolution = ?
+                 ORDER BY time DESC LIMIT ?)""",
+            (mode, epic, resolution, mode, epic, resolution, keep))

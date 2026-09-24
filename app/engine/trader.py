@@ -24,9 +24,11 @@ from app.engine.indicators import warmup_bars
 from app.engine.risk import RiskRejection, market_economics, open_exposure, plan_order
 from app.engine.strategy import evaluate, watched_instruments
 from app.ig_client import IGClient, IGError
+from app.ig_limits import RateLimited, projected_weekly_points
 
 log = logging.getLogger(__name__)
 
+MARKET_CLOSED_RECHECK = timedelta(minutes=10)
 EXPECTED_REJECTIONS = {"MARKET_CLOSED", "MARKET_CLOSED_WITH_EDITS", "MARKET_OFFLINE"}
 REVIEW_INTERVALS = {"hourly": timedelta(hours=1), "daily": timedelta(days=1), "weekly": timedelta(weeks=1)}
 
@@ -53,6 +55,8 @@ class TradingEngine:
         self._ig_lock = threading.Lock()
         self._candles = CandleCache(self.ig)
         self._last_eval: dict[tuple[str, str], datetime] = {}
+        self._next_fetch: dict[tuple[str, str], datetime] = {}
+        self._misses: dict[tuple[str, str], int] = {}
         self._background = ThreadPoolExecutor(max_workers=2, thread_name_prefix="claude-review")
         self._review_running = threading.Lock()
         self.state: dict = {"running": False, "mode": None, "last_cycle": None, "last_error": None,
@@ -80,6 +84,7 @@ class TradingEngine:
                 self._ig.login()
                 self._candles.clear()
                 self._last_eval.clear()
+                self._next_fetch.clear()
             return self._ig
 
     def reset_connection(self) -> None:
@@ -93,6 +98,8 @@ class TradingEngine:
             try:
                 self.cycle()
                 self.state["last_error"] = None
+            except RateLimited as e:  # an expected pause, not a bug
+                self.state["last_error"] = f"paused by IG limit guard: {e}"
             except Exception as e:
                 self.state["last_error"] = str(e)
                 monitor.report(_trigger_for(e), f"engine cycle failed: {e}", e,
@@ -108,10 +115,17 @@ class TradingEngine:
         ig = self.ig()
         assets, indicators = config.load("asset"), config.load("indicator")
 
+        watched = watched_instruments(assets, indicators)
+        self.state["ig_limits"] = {
+            **ig.limits_status(),
+            "projected_weekly_points": projected_weekly_points(
+                [(e, indicators.strategies[s].timeframe) for e, _, s in watched]),
+        }
+
         self.sync_positions(mode)
         self.maybe_periodic_review(mode)
 
-        for epic, asset_class, strat_name in watched_instruments(assets, indicators):
+        for epic, asset_class, strat_name in watched:
             if self._stop.is_set():
                 return
             info = self.state["instruments"].setdefault(epic, {})
@@ -119,6 +133,8 @@ class TradingEngine:
             try:
                 self._process_instrument(ig, mode, epic, asset_class, strat_name, indicators.strategies[strat_name],
                                          info)
+            except RateLimited as e:
+                info["note"] = f"waiting: {e}"
             except Exception as e:
                 info["note"] = f"error: {e}"
                 monitor.report(_trigger_for(e), f"{epic}/{strat_name}: {e}", e,
@@ -131,6 +147,15 @@ class TradingEngine:
         now = datetime.now(timezone.utc)
         if last and now < last + 2 * length:
             return  # next bar hasn't closed yet; don't spend IG price allowance
+        if now < self._next_fetch.get(key, now):
+            return
+
+        # Market status costs one ordinary request, not historical allowance: never poll prices of a shut market.
+        status = (ig.get_market(epic, max_age=300).get("snapshot") or {}).get("marketStatus")
+        if status != "TRADEABLE":
+            info["note"] = f"market {status}; rechecking in {int(MARKET_CLOSED_RECHECK.total_seconds() // 60)} min"
+            self._next_fetch[key] = now + MARKET_CLOSED_RECHECK
+            return
 
         candles = self._candles.closed_candles(epic, strategy.timeframe, warmup_bars(strategy.indicators))
         if len(candles) < 3:
@@ -138,7 +163,13 @@ class TradingEngine:
             return
         latest = candles[-1].time
         if last == latest:
+            # IG hasn't published the new bar yet: back off instead of re-polling every cycle
+            misses = self._misses.get(key, 0) + 1
+            self._misses[key] = misses
+            self._next_fetch[key] = now + min(length, timedelta(seconds=30 * 2 ** misses))
             return
+        self._misses.pop(key, None)
+        self._next_fetch.pop(key, None)
         self._last_eval[key] = latest
         info["last_candle"] = latest.isoformat()
 
@@ -358,4 +389,6 @@ class TradingEngine:
 
 
 def _trigger_for(e: BaseException) -> str:
+    if isinstance(e, RateLimited):
+        return "api_error"
     return "api_error" if isinstance(e, (IGError, anthropic.APIError, service.ClaudeError)) else "exception"

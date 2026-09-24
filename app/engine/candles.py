@@ -64,25 +64,55 @@ def parse_ig_prices(prices: list[dict]) -> list[Candle]:
     return out
 
 
+def _to_row(c: Candle) -> dict:
+    return {"time": c.time.isoformat(), "open": c.open, "high": c.high, "low": c.low, "close": c.close,
+            "volume": c.volume}
+
+
+def _from_row(r: dict) -> Candle:
+    return Candle(datetime.fromisoformat(r["time"]), r["open"], r["high"], r["low"], r["close"], r.get("volume"))
+
+
 class CandleCache:
+    """Keeps candles in memory and SQLite so IG history is only ever fetched once.
+
+    A cold start (no stored candles) fetches the full warm-up window. After that
+    each fetch asks IG only for bars from the last stored one onwards, which is
+    normally 2 data points: the bar that just closed and the one now forming.
+    """
+
     def __init__(self, ig_client_getter):
         self._get_ig = ig_client_getter
-        self._data: dict[tuple[str, str], list[Candle]] = {}
+        self._data: dict[tuple[str, str, str], list[Candle]] = {}
 
     def clear(self) -> None:
         self._data.clear()
 
     def closed_candles(self, epic: str, timeframe: str, needed: int) -> list[Candle]:
         """Return up to ``needed`` fully closed candles, oldest first."""
+        from app import db
+
+        ig = self._get_ig()
         resolution, length = TIMEFRAMES[timeframe]
-        key = (epic, resolution)
-        have = self._data.get(key, [])
-        fetch = needed + 2 if len(have) < needed else 5
-        fresh = parse_ig_prices(self._get_ig().get_prices(epic, resolution, fetch))
+        key = (ig.mode, epic, resolution)
+        have = self._data.get(key)
+        if have is None:
+            have = [_from_row(r) for r in db.load_candles(ig.mode, epic, resolution, needed + 5)]
+
+        now = datetime.now(timezone.utc)
+        if len(have) < needed:
+            raw = ig.get_prices(epic, resolution, needed + 2, high_priority=True)
+        else:
+            elapsed = int((now - have[-1].time) / length)
+            estimate = min(needed + 2, max(1, elapsed) + 1)
+            raw = ig.get_prices(epic, resolution, estimate, since=have[-1].time)
+        fresh = parse_ig_prices(raw)
+
         merged = {c.time: c for c in have}
         for c in fresh:
             merged[c.time] = c
         candles = sorted(merged.values(), key=lambda c: c.time)[-(needed + 5):]
         self._data[key] = candles
-        now = datetime.now(timezone.utc)
+        if fresh:
+            db.save_candles(ig.mode, epic, resolution, [_to_row(c) for c in fresh], keep=needed + 5)
         return [c for c in candles if c.time + length <= now][-needed:]

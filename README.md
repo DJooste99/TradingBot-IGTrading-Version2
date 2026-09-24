@@ -42,5 +42,13 @@ Open http://localhost:8000 and press **Start engine**. Tests: `.venv\Scripts\pip
 - `trades` has extra columns: `status`, `status_note`, `deal_reference`, `deal_id`, `closed_at`. Strategies accept an optional `"direction": "buy"|"sell"` field (default `buy`), and entry rules accept an optional `source` indicator id.
 - If a Claude decision fails (API error or refusal), no trade is placed. The row is logged with `status='error'` and kept out of the "Claude skipped" analysis.
 - `code_monitor.auto_apply_fixes` is locked to `false` by validation. Repeat errors are deduplicated for an hour.
+- **IG API limits are enforced client-side** ([app/ig_limits.py](app/ig_limits.py)). IG allows 60 non-trading requests per minute per app, 30 per account, 100 trading requests per minute, and 10,000 historical price points per week.
+  - Every request waits for a free slot, capped at 90% of each limit. Price and dashboard reads leave 5 slots a minute free for deal confirms, position sync and closes.
+  - If IG returns an `exceeded-*` error, that budget is paused.
+  - The weekly price allowance is read from IG's response `metadata`, saved to disk, and spent only down to a 300-point reserve.
+  - Candles are stored in SQLite, so a restart doesn't download history again. After warm-up, each new candle costs about 2 points.
+  - Prices aren't fetched while a market is closed. The engine checks market status every 10 minutes, which uses one ordinary request and no allowance.
+  - Config saves are rejected if the projected weekly use is over 90% of the allowance. For example, one instrument on 15m is ~960 points/week and one on 1m is ~14,400.
+  - The Overview tab shows live usage.
 - **Prices come from REST polling, not Lightstreamer.** Strategies act on closed candles, so polling is enough, and the candle cache keeps usage inside IG's historical-data allowance. Streaming is a possible later addition.
 - The Claude model comes from `decision_engine.model` (`claude-sonnet-4-6` as in the design) and is used for all four roles. Newer options are `claude-sonnet-5` or `claude-opus-5`.

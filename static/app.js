@@ -108,6 +108,8 @@ async function loadOverview() {
     { label: `P/L (${c})`, get: (r) => fmt(r.pnl), cls: (r) => pnlClass(r.pnl) },
   ]);
 
+  $("#ig-limits").innerHTML = renderLimits(s.engine.ig_limits);
+
   const inst = Object.entries(s.engine.instruments || {}).map(([epic, v]) => ({ epic, ...v }));
   $("#instruments").innerHTML = table(inst, [
     { label: "Epic", key: "epic" }, { label: "Class", key: "asset_class" }, { label: "Strategy", key: "strategy" },
@@ -115,6 +117,23 @@ async function loadOverview() {
     { label: "Rules", get: (r) => (r.last_rules || []).map((x) => `${x.condition}${x.met ? "✓" : "✗"}`).join("  ") },
     { label: "Note", key: "note" },
   ], { empty: "Engine hasn't evaluated any instruments yet. Start the engine." });
+}
+
+const LIMIT_LABELS = { app_non_trading: "Non-trading requests (app)", account_non_trading: "Non-trading requests (account)", account_trading: "Trading requests (account)" };
+function renderLimits(l) {
+  if (!l) return `<p class="muted">Shown once the engine has connected to IG.</p>`;
+  const rows = Object.entries(l.requests).map(([k, v]) => ({ name: LIMIT_LABELS[k] || k, ...v }));
+  const h = l.historical_points;
+  const projPct = Math.round((100 * l.projected_weekly_points) / h.total);
+  let html = table(rows, [
+    { label: "Budget", key: "name" }, { label: "Used (last 60s)", key: "used_last_minute" },
+    { label: "Bot cap / min", key: "limit_enforced" }, { label: "IG limit / min", key: "ig_limit" },
+    { label: "Paused", get: (r) => (r.blocked_for_s ? `${r.blocked_for_s}s` : "–") },
+  ]);
+  html += `<p><b>Historical price points:</b> ${h.remaining === null ? "unknown until the first price request" : `${h.remaining} of ${h.total} left`}${h.resets_in_h !== null ? `, resets in ${h.resets_in_h}h` : ""}
+    <span class="muted">(${h.reserve} held in reserve for warm-ups)</span></p>
+    <p class="${projPct > 80 ? "neg" : "muted"}">Projected routine use with current strategies: ~${l.projected_weekly_points} points/week (${projPct}% of allowance)${projPct > 80 ? " — reduce instruments or use longer timeframes" : ""}.</p>`;
+  return html;
 }
 
 // ---------------------------------------------------------------- trades

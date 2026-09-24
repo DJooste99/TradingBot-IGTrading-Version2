@@ -19,6 +19,7 @@ from app import calibration, config, db  # noqa: E402
 from app.claude import monitor  # noqa: E402
 from app.engine.trader import TradingEngine  # noqa: E402
 from app.ig_client import IGError  # noqa: E402
+from app.ig_limits import check_config_projection  # noqa: E402
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"),
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -134,10 +135,19 @@ async def put_config(name: str, request: Request):
                             "connection config is changed only through the mode switch")
     data = await request.json()
     try:
+        _check_ig_budget(**{name: data})
         config.save(name, data)
     except (ValidationError, ValueError) as e:
         raise HTTPException(422, str(e))
     return {"saved": name}
+
+
+def _check_ig_budget(asset: Optional[dict] = None, indicator: Optional[dict] = None, **_) -> None:
+    """Asset/indicator changes must keep projected IG price-history use within the weekly allowance."""
+    if asset is None and indicator is None:
+        return
+    check_config_projection(config.AssetConfig.model_validate(asset or config.load_raw("asset")),
+                            config.IndicatorConfig.model_validate(indicator or config.load_raw("indicator")))
 
 
 class EnabledClasses(BaseModel):
@@ -149,6 +159,7 @@ def set_enabled(body: EnabledClasses):
     raw = config.load_raw("asset")
     raw["enabled_classes"] = body.enabled_classes
     try:
+        _check_ig_budget(asset=raw)
         config.save("asset", raw)
     except (ValidationError, ValueError) as e:
         raise HTTPException(422, str(e))
