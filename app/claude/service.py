@@ -1,72 +1,84 @@
-"""Claude's four roles: decision engine, post-trade review, periodic review, bug monitor diagnosis."""
+"""Claude's four roles: decision engine, post-trade review, periodic review, bug monitor diagnosis.
+
+Claude is reached through the Claude Code CLI in headless mode (``claude -p``), signed in with the user's
+Claude subscription, not through the Claude API. Each call is a fresh, tool-less session except the trade
+decision, which may use only Claude Code's built-in WebSearch tool.
+"""
 from __future__ import annotations
 
+import glob
 import json
 import logging
+import os
 import re
+import shutil
+import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
-import anthropic
-
-from app.config import DecisionEngineConfig
+from app.config import ROOT, DecisionEngineConfig
 
 log = logging.getLogger(__name__)
 
 CONFIDENCE_RANK = {"low": 0, "medium": 1, "high": 2}
-
-_client: Optional[anthropic.Anthropic] = None
-
-
-def client() -> anthropic.Anthropic:
-    global _client
-    if _client is None:
-        _client = anthropic.Anthropic(max_retries=3, timeout=300)
-    return _client
+CLI_TIMEOUT_SECONDS = 300
+# Empty working directory for the CLI, so its sessions never read or touch the bot's own files.
+CLI_WORKDIR = ROOT / "data" / "claude_cli"
+# Env vars that would make the CLI bill the Claude API instead of using the subscription login.
+API_ENV_VARS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
 
 
 class ClaudeError(Exception):
     pass
 
 
-# ---------------------------------------------------------------- helpers
-def _web_search_tool(model: str, max_uses: int = 5) -> dict:
-    # Dynamic-filtering web search needs Opus/Sonnet 4.6+; older models use the basic variant.
-    legacy = ("haiku" in model or "claude-3" in model or re.search(r"-4-(5|1)\b|-4-\d{8}", model) is not None)
-    return {"type": "web_search_20250305" if legacy else "web_search_20260209",
-            "name": "web_search", "max_uses": max_uses}
+# ---------------------------------------------------------------- Claude Code CLI
+def find_cli() -> Optional[str]:
+    """CLAUDE_CLI env var, then `claude` on PATH, then the copy bundled with the VS Code extension."""
+    configured = os.environ.get("CLAUDE_CLI")
+    if configured:
+        return configured if Path(configured).is_file() else None
+    on_path = shutil.which("claude")
+    if on_path:
+        return on_path
+    bundled = glob.glob(os.path.expanduser(
+        "~/.vscode/extensions/anthropic.claude-code-*/resources/native-binary/claude*"))
+    bundled = [b for b in bundled if Path(b).is_file()]
+    return max(bundled, key=os.path.getmtime) if bundled else None
 
 
-def _thinking(model: str) -> dict:
-    if "haiku" in model:
-        return {}
-    return {"thinking": {"type": "adaptive"}}
-
-
-def _text(response) -> str:
-    return "".join(b.text for b in response.content if b.type == "text")
-
-
-def _check(response) -> None:
-    if response.stop_reason == "refusal":
-        details = getattr(response, "stop_details", None)
-        raise ClaudeError(f"Claude declined the request: {getattr(details, 'explanation', None) or 'refusal'}")
-    if response.stop_reason == "max_tokens":
-        raise ClaudeError("Claude response hit max_tokens before finishing")
-
-
-def _structured(model: str, system: str, prompt: str, schema: dict, max_tokens: int = 16000) -> dict:
-    """Single call with a JSON-schema constrained answer (no tools)."""
-    response = client().messages.create(
-        model=model,
-        max_tokens=max_tokens,
-        system=system,
-        messages=[{"role": "user", "content": prompt}],
-        output_config={"format": {"type": "json_schema", "schema": schema}},
-        **_thinking(model),
-    )
-    _check(response)
-    return json.loads(_text(response))
+def _run_cli(model: str, system: str, prompt: str, schema: dict, tools: tuple[str, ...] = ()) -> dict:
+    """One headless Claude Code session; returns the answer validated against ``schema``."""
+    exe = find_cli()
+    if not exe:
+        raise ClaudeError("Claude Code CLI not found: install Claude Code, or set CLAUDE_CLI to the claude executable")
+    tool_list = ",".join(tools)
+    args = [exe, "-p", "--output-format", "json", "--model", model, "--system-prompt", system,
+            "--json-schema", json.dumps(schema), "--tools", tool_list,
+            # no CLAUDE.md, plugins, hooks or MCP servers; nothing saved; anything needing approval is denied
+            "--safe-mode", "--strict-mcp-config", "--no-session-persistence", "--permission-prompts", "none"]
+    if tools:
+        args += ["--allowedTools", tool_list]
+    env = {k: v for k, v in os.environ.items() if k not in API_ENV_VARS}
+    CLI_WORKDIR.mkdir(parents=True, exist_ok=True)
+    try:
+        proc = subprocess.run(args, input=prompt, capture_output=True, text=True, encoding="utf-8",
+                              timeout=CLI_TIMEOUT_SECONDS, cwd=CLI_WORKDIR, env=env)
+    except subprocess.TimeoutExpired:
+        raise ClaudeError(f"Claude Code did not answer within {CLI_TIMEOUT_SECONDS}s")
+    except OSError as e:
+        raise ClaudeError(f"could not start Claude Code ({exe}): {e}")
+    try:
+        out = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        detail = (proc.stderr or proc.stdout or "").strip()[-400:]
+        raise ClaudeError(f"Claude Code failed (exit {proc.returncode}): {detail or 'no output'}")
+    if out.get("is_error") or out.get("subtype") != "success":
+        # e.g. not logged in, usage limit reached, or the structured answer could not be produced
+        raise ClaudeError(f"Claude Code error ({out.get('subtype')}): {str(out.get('result') or '')[:400]}")
+    structured = out.get("structured_output")
+    return structured if isinstance(structured, dict) else _extract_json(str(out.get("result") or ""))
 
 
 def _extract_json(text: str) -> dict:
@@ -84,7 +96,7 @@ def _extract_json(text: str) -> dict:
 DECISION_SYSTEM = """You are the final decision-maker for an automated trading bot that trades via the IG API.
 
 A technical strategy has produced a candidate signal. Your job is to decide whether to take it, using:
-1. Recent news about the instrument and its drivers (use the web_search tool; focus on the lookback window given).
+1. Recent news about the instrument and its drivers (use the WebSearch tool; focus on the lookback window given).
 2. The bot's own recent trade history on this instrument/strategy, including outcomes and post-trade notes.
 3. The indicator values and rules that fired.
 
@@ -95,11 +107,20 @@ with the news backdrop, or when recent history on this setup has been poor.
 You do NOT control position size, stop-loss or exposure limits; a separate risk manager enforces those regardless
 of your answer, so do not factor sizing into your verdict.
 
-Finish your reply with a single JSON object in a ```json fenced block, with exactly these keys:
-{"decision": "confirm" | "reverse" | "skip",
- "confidence": "low" | "medium" | "high",
- "reasoning": "<2-5 sentences explaining the verdict>",
- "news_summary": "<1-3 sentences on the news you weighed, or 'no material news found'>"}"""
+Answer with: decision (confirm, reverse or skip), confidence (low, medium or high), reasoning (2-5 sentences
+explaining the verdict) and news_summary (1-3 sentences on the news you weighed, or 'no material news found')."""
+
+DECISION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "decision": {"type": "string", "enum": ["confirm", "reverse", "skip"]},
+        "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
+        "reasoning": {"type": "string"},
+        "news_summary": {"type": "string"},
+    },
+    "required": ["decision", "confidence", "reasoning", "news_summary"],
+    "additionalProperties": False,
+}
 
 
 @dataclass
@@ -128,22 +149,10 @@ def decide(signal, history: list[dict], cfg: DecisionEngineConfig, instrument_na
         "recent_trade_history": history,
     }, indent=1, default=str)
 
-    messages = [{"role": "user", "content": (
-        f"Candidate trade signal follows. Search for news on {instrument_name} from the last "
-        f"{cfg.news_lookback_hours} hours, then give your verdict.\n\n{prompt}")}]
-    tools = [_web_search_tool(cfg.model)]
-
-    response = None
-    for _ in range(5):  # resume server-side tool loops that pause
-        response = client().messages.create(
-            model=cfg.model, max_tokens=16000, system=DECISION_SYSTEM,
-            messages=messages, tools=tools, **_thinking(cfg.model))
-        if response.stop_reason != "pause_turn":
-            break
-        messages = [messages[0], {"role": "assistant", "content": response.content}]
-    _check(response)
-
-    verdict = _extract_json(_text(response))
+    verdict = _run_cli(cfg.model, DECISION_SYSTEM,
+                       f"Candidate trade signal follows. Search for news on {instrument_name} from the last "
+                       f"{cfg.news_lookback_hours} hours, then give your verdict.\n\n{prompt}",
+                       DECISION_SCHEMA, tools=("WebSearch",))
     decision = str(verdict.get("decision", "skip")).lower()
     confidence = str(verdict.get("confidence", "low")).lower()
     if confidence not in CONFIDENCE_RANK:
@@ -187,9 +196,8 @@ def post_trade_review(trade: dict, model: str) -> str:
         "timestamp", "closed_at", "mode", "instrument", "asset_class", "strategy",
         "indicator_suggested_direction", "claude_final_direction", "claude_confidence", "claude_reasoning",
         "news_summary", "entry_price", "exit_price", "size", "stop_loss_used", "profit_loss", "indicators_used")}
-    out = _structured(model, POST_TRADE_SYSTEM,
-                      "Review this closed trade:\n" + json.dumps(fields, indent=1, default=str),
-                      POST_TRADE_SCHEMA, max_tokens=4000)
+    out = _run_cli(model, POST_TRADE_SYSTEM,
+                   "Review this closed trade:\n" + json.dumps(fields, indent=1, default=str), POST_TRADE_SCHEMA)
     return out["note"]
 
 
@@ -218,9 +226,8 @@ def periodic_review(trades: list[dict], skipped: list[dict], configs: dict, mode
         "signals_claude_skipped": skipped,
         "current_config": configs,
     }
-    return _structured(model, PERIODIC_SYSTEM,
-                       "Review this batch:\n" + json.dumps(payload, indent=1, default=str),
-                       PERIODIC_SCHEMA)
+    return _run_cli(model, PERIODIC_SYSTEM,
+                    "Review this batch:\n" + json.dumps(payload, indent=1, default=str), PERIODIC_SCHEMA)
 
 
 # ---------------------------------------------------------------- 4. code/bug monitor
@@ -244,4 +251,4 @@ BUG_SCHEMA = {
 def diagnose(trigger_type: str, summary: str, stack: Optional[str], context: dict, source: str, model: str) -> dict:
     prompt = (f"Trigger: {trigger_type}\nError: {summary}\n\nContext:\n{json.dumps(context, indent=1, default=str)}"
               f"\n\nStack trace:\n{stack or '(none)'}\n\nRelevant source:\n{source or '(none)'}")
-    return _structured(model, BUG_SYSTEM, prompt, BUG_SCHEMA)
+    return _run_cli(model, BUG_SYSTEM, prompt, BUG_SCHEMA)

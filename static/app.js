@@ -52,6 +52,7 @@ async function loadStatus() {
   badge.textContent = s.mode.toUpperCase();
   badge.className = `badge ${s.mode}`;
   $("#mode-toggle").textContent = s.mode === "demo" ? "Switch to LIVE" : "Switch to demo";
+  document.querySelectorAll("#exec-toggle button").forEach((b) => b.classList.toggle("active", b.dataset.exec === s.execution_mode));
   const eng = s.engine;
   $("#engine-state").textContent = `engine: ${eng.running ? "running" : "stopped"}${eng.last_cycle ? " · last cycle " + new Date(eng.last_cycle).toLocaleTimeString() : ""}`;
   $("#engine-toggle").textContent = eng.running ? "Stop engine" : "Start engine";
@@ -59,6 +60,7 @@ async function loadStatus() {
   const msgs = [];
   if (s.unreviewed_bugs) msgs.push(`${s.unreviewed_bugs} unreviewed bug report(s) from the code monitor.`);
   if (eng.last_error) msgs.push(`Last engine error: ${eng.last_error}`);
+  if (!s.claude_cli) msgs.push("Claude Code CLI not found: Claude can't check news or decide trades. Install Claude Code and log in, or set CLAUDE_CLI.");
   banner.textContent = msgs.join(" ");
   banner.classList.toggle("hidden", !msgs.length);
   const count = $("#bug-count");
@@ -66,6 +68,14 @@ async function loadStatus() {
   count.classList.toggle("hidden", !s.unreviewed_bugs);
   return s;
 }
+
+document.querySelectorAll("#exec-toggle button").forEach((b) => b.addEventListener("click", async () => {
+  const target = b.dataset.exec;
+  if (target === state.status?.execution_mode) return;
+  if (target === "auto" && !confirm(`Switch to AUTO trading? The bot will place ${state.status.mode.toUpperCase()} orders itself on the next signal.`)) return;
+  try { await api("/api/execution", { method: "POST", body: JSON.stringify({ execution_mode: target }) }); } catch (e) { alert(e.message); }
+  loadOverview();
+}));
 
 $("#engine-toggle").addEventListener("click", async () => {
   await api(`/api/engine/${state.status.engine.running ? "stop" : "start"}`, { method: "POST" });
@@ -75,8 +85,21 @@ $("#engine-toggle").addEventListener("click", async () => {
 // ---------------------------------------------------------------- overview
 async function loadOverview() {
   const s = await loadStatus();
-  const [sum, open] = await Promise.all([api(`/api/summary?mode=${s.mode}`), api(`/api/trades?mode=${s.mode}&status=open`)]);
+  const manual = s.execution_mode === "manual";
+  const [sum, open, signals] = await Promise.all([api(`/api/summary?mode=${s.mode}`), api(`/api/trades?mode=${s.mode}&status=open`),
+    manual ? api(`/api/signals?mode=${s.mode}`) : []]);
   const c = state.currency;
+  $("#signals-panel").classList.toggle("hidden", !manual);
+  if (manual) {
+    $("#follow-through").innerHTML = renderFollowThrough(sum.manual_follow_through || {});
+    const el = $("#signals");
+    el.innerHTML = renderSignals(signals, s.engine.running);
+    el.querySelectorAll("[data-act]").forEach((b) => b.addEventListener("click", async () => {
+      const action = b.dataset.act === "clear" ? null : b.dataset.act;
+      try { await api(`/api/signals/${b.dataset.id}/action`, { method: "POST", body: JSON.stringify({ action }) }); } catch (e) { alert(e.message); }
+      loadOverview();
+    }));
+  }
   $("#summary-cards").innerHTML = [
     ["Total P/L", `${fmt(sum.total_pnl)} ${c}`, pnlClass(sum.total_pnl)],
     ["Win rate", sum.win_rate_pct === null ? "–" : `${sum.win_rate_pct}%`, ""],
@@ -117,6 +140,55 @@ async function loadOverview() {
     { label: "Rules", get: (r) => (r.last_rules || []).map((x) => `${x.condition}${x.met ? "✓" : "✗"}`).join("  ") },
     { label: "Note", key: "note" },
   ], { empty: "Engine hasn't evaluated any instruments yet. Start the engine." });
+}
+
+// One line of advice per signal logged in manual mode: buy, sell, or do nothing (and why).
+function signalAdvice(r) {
+  const sl = r.stop_loss_used || {};
+  if (["suggested", "open", "closed"].includes(r.status) && ["buy", "sell"].includes(r.claude_final_direction)) {
+    const dir = r.claude_final_direction;
+    const changed = r.indicator_suggested_direction && r.indicator_suggested_direction !== dir ? ` (Claude reversed the strategy's ${r.indicator_suggested_direction} signal)` : "";
+    // once placed, size/entry/stop hold the real fill; the original advice is kept as suggested_*
+    const size = sl.suggested_size ?? r.size, price = sl.suggested_price ?? r.entry_price;
+    const stop = sl.suggested_stop_price ?? sl.stop_price;
+    return { cls: dir, label: dir.toUpperCase(), text: `You can ${dir.toUpperCase()} ${size} of ${r.instrument} at about ${fmt(price, 5)}, stop ${fmt(stop, 5)}${sl.take_profit_price ? `, take profit ${fmt(sl.take_profit_price, 5)}` : ""}${changed}.` };
+  }
+  const why = r.status === "skipped" ? `Claude advises against the strategy's ${r.indicator_suggested_direction} signal${r.claude_confidence ? ` (${r.claude_confidence} confidence)` : ""}.`
+    : r.status === "rejected_risk" ? `The ${r.claude_final_direction} signal breaks the risk limits: ${r.status_note}.`
+    : `The ${r.indicator_suggested_direction} signal couldn't be assessed: ${r.status_note || r.status}.`;
+  return { cls: "none", label: "DO NOTHING", text: why };
+}
+
+// What happened to a BUY/SELL suggestion: waiting for an answer, ignored, or placed and tracked on IG.
+function signalState(r) {
+  const btn = (act, label) => `<button class="btn small" data-act="${act}" data-id="${r.id}">${label}</button>`;
+  if (r.status === "open") return `<span class="pill ok">placed</span> Open on IG: ${esc(r.size)} @ ${fmt(r.entry_price, 5)}. Tracked until it closes.`;
+  if (r.status === "closed") return `<span class="pill ok">placed</span> Closed @ ${fmt(r.exit_price, 5)}, P/L <span class="${pnlClass(r.profit_loss)}">${fmt(r.profit_loss)} ${esc(state.currency)}</span>`;
+  if (r.user_action === "placed") return `<span class="pill">placed</span> Looking for this position on IG… ${btn("clear", "Undo")}`;
+  if (r.user_action === "ignored") return `<span class="pill">ignored</span> ${btn("clear", "Undo")}`;
+  return `${btn("placed", "I placed it")} ${btn("ignored", "Ignore")}`;
+}
+
+function renderFollowThrough(f) {
+  const n = (k) => f[k]?.n || 0;
+  if (!n("placed") && !n("ignored") && !n("pending")) return "";
+  const placed = f.placed;
+  return `<span><b>${n("placed")}</b> placed</span><span><b>${n("ignored")}</b> ignored</span><span><b>${n("pending")}</b> no answer yet</span>` +
+    (placed?.closed ? `<span>P/L on ${placed.closed} closed: <b class="${pnlClass(placed.pnl)}">${fmt(placed.pnl)} ${esc(state.currency)}</b></span>` : "");
+}
+
+function renderSignals(rows, running) {
+  if (!rows.length) return `<p class="muted">${running ? "No signals yet. Advice appears here when a strategy fires." : "Start the engine to receive signals."}</p>`;
+  const staleAfter = 2 * 3600 * 1000;  // older advice is shown faded: the price has likely moved
+  return rows.map((r) => {
+    const a = signalAdvice(r);
+    const actionable = r.status === "suggested" && !r.user_action;
+    const stale = actionable && Date.now() - new Date(r.timestamp) > staleAfter;
+    return `<div class="signal ${stale ? "stale" : ""}"><span class="action ${a.cls}">${a.label}</span>
+      <div class="msg">${esc(a.text)}<br><span class="muted">${new Date(r.timestamp).toLocaleString()} · ${esc(r.strategy)} · #${r.id}${stale ? " · old signal, check the price" : ""}</span>
+      ${a.cls !== "none" ? `<div class="signal-state">${signalState(r)}</div>` : ""}
+      ${r.claude_reasoning ? `<details><summary>Reasoning</summary>${esc(r.claude_reasoning)}${r.news_summary ? `<br><b>News:</b> ${esc(r.news_summary)}` : ""}</details>` : ""}</div></div>`;
+  }).join("");
 }
 
 const LIMIT_LABELS = { app_non_trading: "Non-trading requests (app)", account_non_trading: "Non-trading requests (account)", account_trading: "Trading requests (account)" };
@@ -279,6 +351,7 @@ async function openModeModal() {
       <tr><th>Class strategies</th><td>${esc(mapping)}</td></tr>
       <tr><th>Instrument overrides</th><td>${esc(overrides)}</td></tr>
       <tr><th>Strategies</th><td>${esc(Object.entries(p.strategies.strategies).map(([n, s]) => `${n} (${s.timeframe}, stop ${s.stop_loss ? s.stop_loss.mode : "default"})`).join("; "))}</td></tr>
+      <tr><th>Trading mode</th><td>${p.execution_mode === "auto" ? "<b>Auto</b>: the bot places orders itself" : "Manual: advice only, no orders placed"}</td></tr>
       <tr><th>Claude decisions</th><td>${p.decision_engine.enabled ? `on for ${esc(p.decision_engine.run_on.join("/"))}, min confidence ${esc(p.decision_engine.min_confidence_to_trade)}` : "off"}</td></tr>
     </table>`;
   let canConfirm = true;
@@ -294,7 +367,8 @@ async function openModeModal() {
         canConfirm = false;
       }
     }
-    body += `<p><b>Real money will be traded with the settings above.</b></p>`;
+    body += p.execution_mode === "auto" ? `<p><b>Real money will be traded with the settings above.</b></p>`
+      : `<p>Manual trading is on, so the bot will only advise. Switching to Auto later starts real-money trading.</p>`;
   }
   $("#modal-title").textContent = `Switch to ${target.toUpperCase()}`;
   $("#modal-body").innerHTML = body;

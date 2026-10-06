@@ -6,6 +6,7 @@ A web app that runs an automated trading bot against the IG Trading API. Key req
 
 - Trade across four asset classes: shares, indices, forex, commodities
 - Switch between IG demo and live accounts without reconfiguring strategy settings
+- Choose between **Auto trading** (the bot places orders itself) and **Manual trading** (the bot only shows a message: buy, sell, or do nothing; you place any trade yourself)
 - Multiple simultaneous strategies, each combining multiple technical indicators
 - Hard risk limits (max exposure, max per trade) and configurable stop-loss (fixed % or ATR-based dynamic)
 - Every trade logged (price, P/L, indicators used, strategy, timestamp, mode)
@@ -22,18 +23,18 @@ flowchart TD
     B --> C[Trading engine]
     B --> D[Config files + SQLite log]
     C --> E[IG API - demo and live]
-    C --> F[Claude API]
+    C --> F[Claude Code CLI - subscription]
 ```
 
 **Components:**
 
-- **Dashboard (browser)** — asset class picker, demo/live toggle with confirmation modal, strategy/indicator config editor, live trade log view, P/L summary, Claude decision history, bug report review
+- **Dashboard (browser)** — asset class picker, demo/live toggle with confirmation modal, Auto/Manual trading switch, manual trading signals panel, strategy/indicator config editor, live trade log view, P/L summary, Claude decision history, bug report review
 - **Backend server** — hosts the trading engine and reads/writes the config files and SQLite database
 - **Trading engine** — evaluates indicator strategies, calls Claude for a final decision, enforces risk limits, sends orders
 - **Config files** — plain JSON, described in full below
 - **SQLite log** — trades, periodic reviews, bug reports
 - **IG API** — REST for orders and account data, streaming (Lightstreamer) for live prices; demo and live are separate base URLs and credentials
-- **Claude API** — final trade decisions (with its own web search for news), post-trade reviews, periodic batch reviews, runtime bug diagnosis
+- **Claude (via the Claude Code CLI)** — final trade decisions (with its own web search for news), post-trade reviews, periodic batch reviews, runtime bug diagnosis. The bot runs Claude Code headless (`claude -p`) signed in with the user's Claude subscription. No Claude API key is used.
 
 ### Trade decision pipeline
 
@@ -43,6 +44,15 @@ flowchart TD
     B --> C[Risk manager<br/>caps and stop-loss enforced]
     C --> D[IG API<br/>order execution]
 ```
+
+In **Manual trading** the pipeline runs exactly the same up to the last step: Claude decides and the risk manager sizes the trade, but instead of sending the order the engine logs it as a suggestion and the dashboard shows the message:
+
+- **BUY / SELL** — "You can BUY 0.24 of IX.D.FTSE.DAILY.IP at about 8001, stop 7761", with Claude's reasoning and news. The size and stop already respect the risk limits.
+- **DO NOTHING** — Claude skipped the signal, or the risk manager rejected it, with the reason.
+
+Nothing is sent to IG in manual mode. Positions the bot already opened in Auto mode are still tracked until they close.
+
+**Manual trades are still logged.** When you place a suggested trade yourself on IG, the engine links it to the suggestion: it matches a new IG position to the newest open suggestion for the same instrument and direction, made in the 24 hours before the position was opened. The suggestion row then records the real deal, fill price, size and stop, and is tracked exactly like a bot trade (close, P/L, post-trade review, calibration). Each message also has **I placed it** / **Ignore** buttons, so the log shows which suggestions you followed. IG positions that match no suggestion are your own trades and are not logged.
 
 Important: **the risk manager is never bypassed.** Claude decides direction and whether to trade at all; it cannot raise `max_per_trade`, `max_total_exposure`, or override the stop-loss method. Those limits are enforced downstream of every decision, regardless of source.
 
@@ -57,6 +67,7 @@ All configuration is plain JSON, checked into version control safely (real crede
 ```json
 {
   "active_mode": "demo",
+  "execution_mode": "auto",
   "demo": {
     "api_key": "env:IG_DEMO_API_KEY",
     "username": "env:IG_DEMO_USERNAME",
@@ -75,6 +86,7 @@ All configuration is plain JSON, checked into version control safely (real crede
 | Field | Meaning |
 |---|---|
 | `active_mode` | The single switch: `"demo"` or `"live"`. Every other module reads this to decide which credentials/URL to use. |
+| `execution_mode` | `"auto"` (the bot places orders) or `"manual"` (advice only: buy, sell or do nothing). Set from the Auto/Manual switch in the dashboard header. Independent of `active_mode`, so manual trading works on demo or live. |
 | `demo` / `live` | Separate credential blocks — IG issues a distinct API key and login per environment. |
 | `api_key` | IG API key for that environment. |
 | `username` / `password` | IG login for that environment. |
@@ -227,7 +239,8 @@ All configuration is plain JSON, checked into version control safely (real crede
 | Field | Meaning |
 |---|---|
 | `decision_engine.run_on` | Demo and live both — lets you build a track record of how good Claude's calls are before it's deciding with real money. |
-| `decision_engine.news_source` | `"web_search"` — Claude uses its own web search rather than a separate news API. |
+| `decision_engine.news_source` | `"web_search"` — Claude uses Claude Code's built-in WebSearch tool, not a separate news API. That's the only tool the decision session can use. |
+| `decision_engine.model` | Model Claude Code runs (`--model`): a full name like `claude-sonnet-4-6`, or an alias like `sonnet`. Used for all four roles. |
 | `decision_engine.trade_history_lookback` | How many past trades (on the relevant instrument/strategy) are included as context for each decision — this is how Claude "learns" from the log without any literal model training. |
 | `decision_engine.min_confidence_to_trade` | Below this confidence, the engine treats Claude's verdict as "skip" rather than forcing a low-confidence trade. |
 | `live_promotion.*` | The calibration gate — demo track record must clear these thresholds before switching to live is allowed without an explicit manual override. |
@@ -259,7 +272,10 @@ CREATE TABLE trades (
     stop_loss_used TEXT,                    -- JSON, e.g. {"mode":"atr_dynamic","atr_value":0.00021,"multiplier":1.5,"stop_price":1.1701}
     profit_loss REAL,
     indicators_used TEXT NOT NULL,          -- JSON blob of indicator values at decision time
-    claude_post_trade_note TEXT
+    claude_post_trade_note TEXT,
+    status TEXT,                            -- 'suggested' marks a manual-mode trade that was advised, not placed
+    execution_mode TEXT,                    -- 'auto' or 'manual' when the signal was handled
+    user_action TEXT                        -- manual suggestions: NULL (no answer), 'placed' or 'ignored'
 );
 
 CREATE TABLE claude_periodic_reviews (
@@ -309,7 +325,7 @@ Once all three are met, the dashboard allows switching `active_mode` to `"live"`
 
 ## 6. Open items before/while coding
 
-- **Tech stack** — not yet decided. A reasonable starting point for this app: Python backend (FastAPI) for the trading engine, IG API calls, and Claude API calls; SQLite via a lightweight ORM (SQLModel/SQLAlchemy) for the log; a simple React or vanilla JS frontend for the dashboard. Worth confirming before writing code, since it affects how everything is scaffolded.
+- **Tech stack** — not yet decided. A reasonable starting point for this app: Python backend (FastAPI) for the trading engine, IG API calls, and Claude calls (now made through the Claude Code CLI); SQLite via a lightweight ORM (SQLModel/SQLAlchemy) for the log; a simple React or vanilla JS frontend for the dashboard. Worth confirming before writing code, since it affects how everything is scaffolded.
 - **News search scope** — Claude uses its own web search; may be worth deciding search recency window and how many articles to summarize per decision, once you see real output quality.
 - **ATR-based position sizing** — currently `max_per_trade` is a flat cap regardless of stop width. A natural v2 addition once dynamic stops are working: size the position so £-risk-per-trade stays constant even as the ATR-based stop distance varies.
 - **Rule logic nesting** — `rule_logic` currently supports flat `"all"`/`"any"` only. If a strategy later needs mixed AND/OR (e.g. "A and (B or C)"), the schema will need nested rule groups.

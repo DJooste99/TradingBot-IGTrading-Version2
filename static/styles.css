@@ -43,6 +43,23 @@ body {
 .badge.demo { background: var(--demo); }
 .badge.live { background: var(--live); }
 .engine-state { color: var(--muted); }
+.segmented { display: inline-flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+.segmented button {
+  border: none; background: var(--panel); color: var(--muted); padding: 6px 12px; cursor: pointer; font: inherit;
+}
+.segmented button + button { border-left: 1px solid var(--border); }
+.segmented button.active { background: var(--accent); color: #fff; font-weight: 600; }
+.signal { display: flex; gap: 12px; align-items: flex-start; border-top: 1px solid var(--border); padding: 10px 0; }
+.signal:first-child { border-top: none; }
+.signal.stale { opacity: .6; }
+.signal .msg { flex: 1; }
+.action { min-width: 96px; text-align: center; padding: 3px 10px; border-radius: 6px; font-weight: 700; color: #fff; }
+.action.buy { background: var(--good); }
+.action.sell { background: var(--bad); }
+.action.none { background: var(--muted); }
+.signal-state { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 6px; }
+.follow { display: flex; flex-wrap: wrap; gap: 16px; margin-bottom: 8px; }
+.follow:empty { display: none; }
 .btn {
   border: 1px solid var(--border); background: var(--panel); color: var(--text);
   padding: 6px 12px; border-radius: 6px; cursor: pointer; font: inherit;

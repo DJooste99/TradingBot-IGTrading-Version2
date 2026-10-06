@@ -1,5 +1,6 @@
 {
   "active_mode": "demo",
+  "execution_mode": "auto",
   "demo": {
     "api_key": "env:IG_DEMO_API_KEY",
     "username": "env:IG_DEMO_USERNAME",

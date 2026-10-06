@@ -1,6 +1,7 @@
 .env
 data/*.db
 data/*.db-*
+data/claude_cli/
 __pycache__/
 *.pyc
 .venv/

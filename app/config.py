@@ -18,6 +18,7 @@ CONFIG_DIR = Path(os.environ.get("BOT_CONFIG_DIR", ROOT / "config"))
 
 ASSET_CLASSES = ("shares", "indices", "forex", "commodities")
 Mode = Literal["demo", "live"]
+ExecutionMode = Literal["auto", "manual"]  # auto places orders; manual only shows buy/sell/do-nothing advice
 Confidence = Literal["low", "medium", "high"]
 
 _lock = threading.Lock()
@@ -33,6 +34,7 @@ class Credentials(BaseModel):
 
 class ConnectionConfig(BaseModel):
     active_mode: Mode
+    execution_mode: ExecutionMode = "auto"
     demo: Credentials
     live: Credentials
 
@@ -253,6 +255,10 @@ def active_mode() -> str:
     return load("connection").active_mode
 
 
+def execution_mode() -> str:
+    return load("connection").execution_mode
+
+
 def credentials_for(mode: str) -> dict:
     conn: ConnectionConfig = load("connection")
     creds: Credentials = getattr(conn, mode)
@@ -267,4 +273,10 @@ def credentials_for(mode: str) -> dict:
 def set_active_mode(mode: str) -> None:
     raw = load_raw("connection")
     raw["active_mode"] = mode
+    save("connection", raw)
+
+
+def set_execution_mode(execution: str) -> None:
+    raw = load_raw("connection")
+    raw["execution_mode"] = execution
     save("connection", raw)

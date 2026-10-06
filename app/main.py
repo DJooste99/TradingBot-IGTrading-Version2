@@ -16,7 +16,7 @@ from fastapi.staticfiles import StaticFiles  # noqa: E402
 from pydantic import BaseModel, ValidationError  # noqa: E402
 
 from app import calibration, config, db  # noqa: E402
-from app.claude import monitor  # noqa: E402
+from app.claude import monitor, service  # noqa: E402
 from app.engine.trader import TradingEngine  # noqa: E402
 from app.ig_client import IGError  # noqa: E402
 from app.ig_limits import check_config_projection  # noqa: E402
@@ -57,10 +57,12 @@ def status():
     mode = config.active_mode()
     return {
         "mode": mode,
+        "execution_mode": config.execution_mode(),
         "engine": engine.state,
         "unreviewed_bugs": db.count_unreviewed_bugs(),
         "calibration": calibration.gate_status(),
         "currency": config.load("risk").currency,
+        "claude_cli": service.find_cli(),
     }
 
 
@@ -88,6 +90,7 @@ def mode_preview():
     """Everything the confirmation modal reads back before a switch."""
     return {
         "current_mode": config.active_mode(),
+        "execution_mode": config.execution_mode(),
         "risk": config.load_raw("risk"),
         "assets": config.load_raw("asset"),
         "strategies": config.load_raw("indicator"),
@@ -118,6 +121,44 @@ def switch_mode(body: ModeSwitch):
     engine.reset_connection()
     log.warning("active_mode switched to %s", body.mode)
     return {"mode": body.mode, "changed": True}
+
+
+# ---------------------------------------------------------------- auto / manual trading
+class ExecutionSwitch(BaseModel):
+    execution_mode: str
+
+
+@app.post("/api/execution")
+def switch_execution(body: ExecutionSwitch):
+    if body.execution_mode not in ("auto", "manual"):
+        raise HTTPException(400, "execution_mode must be 'auto' or 'manual'")
+    config.set_execution_mode(body.execution_mode)
+    log.warning("execution_mode switched to %s (%s account)", body.execution_mode, config.active_mode())
+    return {"execution_mode": body.execution_mode}
+
+
+@app.get("/api/signals")
+def manual_signals(mode: Optional[str] = None, limit: int = 20):
+    """Buy / sell / do-nothing advice logged while in manual trading mode."""
+    return db.manual_signals(mode or config.active_mode(), min(limit, 200))
+
+
+class SignalAction(BaseModel):
+    action: Optional[str]  # 'placed', 'ignored', or null to clear the answer
+
+
+@app.post("/api/signals/{trade_id}/action")
+def signal_action(trade_id: int, body: SignalAction):
+    """Record what the user did with a manual buy/sell suggestion."""
+    if body.action is not None and body.action not in db.USER_ACTIONS:
+        raise HTTPException(400, f"action must be one of {db.USER_ACTIONS} or null")
+    trade = db.get_trade(trade_id)
+    if not trade or trade["execution_mode"] != "manual" or trade["claude_final_direction"] not in ("buy", "sell"):
+        raise HTTPException(404, "no manual buy/sell suggestion with that id")
+    if trade["status"] != "suggested":
+        raise HTTPException(409, f"suggestion is already linked to an IG position ({trade['status']})")
+    db.update_trade(trade_id, user_action=body.action)
+    return {"id": trade_id, "user_action": body.action}
 
 
 # ---------------------------------------------------------------- config

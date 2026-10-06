@@ -202,23 +202,51 @@ def test_pipeline_low_confidence_is_skip(monkeypatch):
     from app.claude import service
     from app.engine.trader import TradingEngine
 
-    class FakeResp:
-        stop_reason = "end_turn"
-        content = [type("B", (), {"type": "text", "text":
-                   '```json\n{"decision":"confirm","confidence":"low","reasoning":"meh","news_summary":"none"}\n```'})()]
-
-    class FakeMessages:
-        def create(self, **kw):
-            assert kw["tools"][0]["type"] == "web_search_20260209"
-            return FakeResp()
-
-    monkeypatch.setattr(service, "client", lambda: type("C", (), {"messages": FakeMessages()})())
+    calls = fake_claude_cli(monkeypatch, {"type": "result", "subtype": "success", "is_error": False, "structured_output":
+                            {"decision": "confirm", "confidence": "low", "reasoning": "meh", "news_summary": "none"}})
     ig = FakeIG()
     tid = TradingEngine().handle_signal(ig, "demo", make_signal(), {})
     t = db.get_trade(tid)
     assert t["claude_final_direction"] == "skipped" and t["status"] == "skipped"
     assert ig.orders == []
     assert db.skipped_vs_suggested("demo")[0]["id"] == tid
+    args, kw = calls[0]
+    assert args[args.index("--tools") + 1] == "WebSearch" and args[args.index("--model") + 1] == "claude-sonnet-4-6"
+    assert "Search for news" in kw["input"]
+    assert "ANTHROPIC_API_KEY" not in kw["env"]  # must use the subscription login, never API billing
+
+
+def fake_claude_cli(monkeypatch, result: dict, returncode: int = 0, stderr: str = ""):
+    import subprocess
+    from app.claude import service
+    calls = []
+    monkeypatch.setattr(service, "find_cli", lambda: "claude")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-should-not-be-passed")
+
+    def run(args, **kw):
+        calls.append((args, kw))
+        return subprocess.CompletedProcess(args, returncode, json.dumps(result) if result else "", stderr)
+    monkeypatch.setattr(service.subprocess, "run", run)
+    return calls
+
+
+def test_claude_cli_errors_become_claude_errors(monkeypatch):
+    from app.claude import service
+    fake_claude_cli(monkeypatch, {"type": "result", "subtype": "success", "is_error": True,
+                                  "result": "Not logged in · Please run /login"})
+    with pytest.raises(service.ClaudeError, match="Not logged in"):
+        service.post_trade_review({}, "sonnet")
+    fake_claude_cli(monkeypatch, {}, returncode=1, stderr="boom")
+    with pytest.raises(service.ClaudeError, match="boom"):
+        service.post_trade_review({}, "sonnet")
+    calls = fake_claude_cli(monkeypatch, {"type": "result", "subtype": "success", "is_error": False,
+                                          "structured_output": {"note": "fine"}})
+    assert service.post_trade_review({}, "sonnet") == "fine"
+    args = calls[0][0]
+    assert args[args.index("--tools") + 1] == "" and "--allowedTools" not in args  # reviews get no tools
+    monkeypatch.setattr(service, "find_cli", lambda: None)
+    with pytest.raises(service.ClaudeError, match="not found"):
+        service.post_trade_review({}, "sonnet")
 
 
 def test_pipeline_broker_rejection_is_reported(monkeypatch):
@@ -231,6 +259,106 @@ def test_pipeline_broker_rejection_is_reported(monkeypatch):
     tid = TradingEngine().handle_signal(FakeIG(status="REJECTED"), "demo", make_signal(), {})
     assert db.get_trade(tid)["status"] == "rejected_broker"
     assert reports and reports[0][0] == "order_rejection"
+
+
+def test_manual_mode_suggests_without_ordering(monkeypatch):
+    from app import config, db
+    from app.claude import service
+    from app.engine.trader import TradingEngine
+    config.set_execution_mode("manual")
+    monkeypatch.setattr(service, "decide", lambda *a, **k: service.Decision("buy", "confirm", "high", "ok", "calm"))
+    ig, info = FakeIG(), {}
+    tid = TradingEngine().handle_signal(ig, "demo", make_signal(), info)
+    t = db.get_trade(tid)
+    assert ig.orders == []
+    assert t["status"] == "suggested" and t["execution_mode"] == "manual"
+    assert t["size"] == 0.24 and t["entry_price"] == 8001.0 and t["stop_loss_used"]["stop_price"] > 0
+    assert "suggested buy" in info["note"]
+    assert db.open_trades("demo") == []
+    assert [r["id"] for r in db.manual_signals("demo")] == [tid]
+
+
+def test_manual_mode_skip_is_a_do_nothing_signal(monkeypatch):
+    from app import config, db
+    from app.claude import service
+    from app.engine.trader import TradingEngine
+    config.set_execution_mode("manual")
+    monkeypatch.setattr(service, "decide", lambda *a, **k: service.Decision("skipped", "skip", "low", "no", None))
+    tid = TradingEngine().handle_signal(FakeIG(), "demo", make_signal(), {})
+    t = db.manual_signals("demo")[0]
+    assert t["id"] == tid and t["status"] == "skipped" and t["execution_mode"] == "manual"
+
+
+def ig_position(deal_id, epic, direction, created, level=8001.0, size=0.5):
+    return {"position": {"dealId": deal_id, "dealReference": "REF-" + deal_id, "direction": direction,
+                         "size": size, "level": level, "stopLevel": 7700.0,
+                         "createdDateUTC": created.strftime("%Y-%m-%dT%H:%M:%S")},
+            "market": {"epic": epic}}
+
+
+def test_manual_trade_on_ig_is_linked_then_logged_through_close(monkeypatch):
+    from app import config, db
+    from app.claude import service
+    from app.engine.trader import TradingEngine
+    config.set_execution_mode("manual")
+    monkeypatch.setattr(service, "decide", lambda *a, **k: service.Decision("buy", "confirm", "high", "ok", "calm"))
+    eng, ig = TradingEngine(), FakeIG()
+    monkeypatch.setattr(eng, "ig", lambda: ig)
+    reviewed = []
+    monkeypatch.setattr(eng, "schedule_post_trade_review", lambda tid, mode: reviewed.append(tid))
+    tid = eng.handle_signal(ig, "demo", make_signal(), {})
+
+    now = datetime.now(timezone.utc)
+    ig.positions = [
+        ig_position("OLD", "IX.D.FTSE.DAILY.IP", "BUY", now - timedelta(hours=1)),  # opened before the advice
+        ig_position("OTHER", "CS.D.EURUSD.CFD.IP", "BUY", now),                     # different instrument
+        ig_position("SELL1", "IX.D.FTSE.DAILY.IP", "SELL", now),                    # wrong direction
+        ig_position("D1", "IX.D.FTSE.DAILY.IP", "BUY", now + timedelta(seconds=30)),
+    ]
+    eng.sync_positions("demo")
+    t = db.get_trade(tid)
+    assert t["status"] == "open" and t["deal_id"] == "D1" and t["user_action"] == "placed"
+    assert t["size"] == 0.5 and t["entry_price"] == 8001.0
+    assert t["stop_loss_used"]["stop_price"] == 7700.0 and t["stop_loss_used"]["suggested_size"] == 0.24
+    assert db.known_deal_ids("demo") == {"D1"}
+
+    ig.positions = []  # user closed it on IG
+    eng.sync_positions("demo")
+    t = db.get_trade(tid)
+    assert t["status"] == "closed" and t["profit_loss"] == 11.76 and reviewed == [tid]
+    follow = db.pnl_summary("demo")["manual_follow_through"]
+    assert follow["placed"] == {"n": 1, "closed": 1, "pnl": 11.76}
+
+
+def test_ignored_suggestion_is_not_linked(monkeypatch):
+    from app import config, db
+    from app.claude import service
+    from app.engine.trader import TradingEngine
+    config.set_execution_mode("manual")
+    monkeypatch.setattr(service, "decide", lambda *a, **k: service.Decision("buy", "confirm", "high", "ok", "calm"))
+    eng, ig = TradingEngine(), FakeIG()
+    monkeypatch.setattr(eng, "ig", lambda: ig)
+    tid = eng.handle_signal(ig, "demo", make_signal(), {})
+    db.update_trade(tid, user_action="ignored")
+    ig.positions = [ig_position("D1", "IX.D.FTSE.DAILY.IP", "BUY", datetime.now(timezone.utc))]
+    eng.sync_positions("demo")
+    assert db.get_trade(tid)["status"] == "suggested"
+    assert db.pnl_summary("demo")["manual_follow_through"]["ignored"]["n"] == 1
+
+
+def test_db_migration_adds_execution_mode(tmp_path, monkeypatch):
+    import sqlite3
+    from app import db
+    path = tmp_path / "old.db"
+    old = sqlite3.connect(path)
+    old.execute("CREATE TABLE trades (id INTEGER PRIMARY KEY, timestamp TEXT, mode TEXT, instrument TEXT, "
+                "asset_class TEXT, strategy TEXT, claude_final_direction TEXT, indicators_used TEXT, status TEXT)")
+    old.commit()
+    old.close()
+    monkeypatch.setattr(db, "DB_PATH", path)
+    db.init_db()
+    with db.connect() as conn:
+        assert {"execution_mode", "user_action"} <= {r["name"] for r in conn.execute("PRAGMA table_info(trades)")}
 
 
 # ---------------------------------------------------------------- API
@@ -252,3 +380,35 @@ def test_api_mode_switch_gate():
         assert c.put("/api/assets/enabled", json={"enabled_classes": ["forex"]}).status_code == 200
         assert c.get("/").status_code == 200
         assert c.get("/api/summary").json()["closed_trades"] == 0
+
+
+def test_api_execution_switch():
+    from fastapi.testclient import TestClient
+    from app import config
+    from app.main import app
+    with TestClient(app) as c:
+        assert c.get("/api/status").json()["execution_mode"] == "auto"
+        assert c.post("/api/execution", json={"execution_mode": "sometimes"}).status_code == 400
+        assert c.post("/api/execution", json={"execution_mode": "manual"}).status_code == 200
+        assert config.execution_mode() == "manual" and config.active_mode() == "demo"
+        assert c.get("/api/mode/preview").json()["execution_mode"] == "manual"
+        assert c.get("/api/signals").json() == []
+
+
+def test_api_signal_actions():
+    from fastapi.testclient import TestClient
+    from app import db
+    from app.main import app
+    base = dict(mode="demo", instrument="E", asset_class="indices", strategy="s", indicators_used={},
+                execution_mode="manual")
+    sug = db.insert_trade(**base, claude_final_direction="buy", status="suggested")
+    skip = db.insert_trade(**base, claude_final_direction="skipped", status="skipped")
+    linked = db.insert_trade(**base, claude_final_direction="buy", status="open", deal_id="D9")
+    with TestClient(app) as c:
+        assert c.post(f"/api/signals/{sug}/action", json={"action": "ignored"}).status_code == 200
+        assert db.get_trade(sug)["user_action"] == "ignored"
+        assert c.post(f"/api/signals/{sug}/action", json={"action": None}).status_code == 200
+        assert db.get_trade(sug)["user_action"] is None
+        assert c.post(f"/api/signals/{sug}/action", json={"action": "maybe"}).status_code == 400
+        assert c.post(f"/api/signals/{skip}/action", json={"action": "placed"}).status_code == 404
+        assert c.post(f"/api/signals/{linked}/action", json={"action": "ignored"}).status_code == 409

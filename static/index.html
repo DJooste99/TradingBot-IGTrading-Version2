@@ -12,6 +12,10 @@
   <div class="topbar-controls">
     <span id="mode-badge" class="badge">…</span>
     <button id="mode-toggle" class="btn">Switch mode</button>
+    <div id="exec-toggle" class="segmented" role="group" aria-label="Trading mode">
+      <button data-exec="auto" title="The bot places orders itself">Auto trading</button>
+      <button data-exec="manual" title="The bot only tells you to buy, sell or do nothing">Manual trading</button>
+    </div>
     <span id="engine-state" class="engine-state">engine: …</span>
     <button id="engine-toggle" class="btn">Start engine</button>
   </div>
@@ -31,6 +35,13 @@
 <main>
   <!-- Overview -->
   <section id="tab-overview" class="tab active">
+    <div class="panel hidden" id="signals-panel">
+      <h2>Manual trading signals</h2>
+      <p class="muted">The bot is not placing orders. Each signal below is advice only: place the trade yourself on IG, or do nothing.
+        Trades you place on IG are linked to the matching suggestion automatically (same instrument and direction, within 24h) and then logged like any other trade.</p>
+      <div id="follow-through" class="follow"></div>
+      <div id="signals"></div>
+    </div>
     <div class="cards" id="summary-cards"></div>
     <div class="grid2">
       <div class="panel">
@@ -61,7 +72,7 @@
     <div class="filters">
       <label>Mode <select id="f-mode"><option value="">all</option><option>demo</option><option>live</option></select></label>
       <label>Status <select id="f-status"><option value="">all</option><option>open</option><option>closed</option>
-        <option>skipped</option><option>rejected_risk</option><option>rejected_broker</option><option>error</option></select></label>
+        <option>suggested</option><option>skipped</option><option>rejected_risk</option><option>rejected_broker</option><option>error</option></select></label>
       <button class="btn" id="f-refresh">Refresh</button>
     </div>
     <div id="trades-table"></div>

@@ -39,11 +39,13 @@ CREATE TABLE IF NOT EXISTS trades (
     indicators_used TEXT NOT NULL,
     claude_post_trade_note TEXT,
     -- operational columns (not in the original design schema)
-    status TEXT NOT NULL DEFAULT 'pending', -- skipped, rejected_risk, rejected_broker, open, closed, error
+    status TEXT NOT NULL DEFAULT 'pending', -- skipped, suggested, rejected_risk, rejected_broker, open, closed, error
     status_note TEXT,
     deal_reference TEXT,
     deal_id TEXT,
-    closed_at TEXT
+    closed_at TEXT,
+    execution_mode TEXT NOT NULL DEFAULT 'auto', -- 'auto' (bot places orders) or 'manual' (advice only)
+    user_action TEXT -- manual suggestions only: NULL (no answer yet), 'placed' or 'ignored'
 );
 CREATE INDEX IF NOT EXISTS idx_trades_mode_status ON trades(mode, status);
 CREATE INDEX IF NOT EXISTS idx_trades_instrument ON trades(instrument, strategy);
@@ -88,6 +90,8 @@ CREATE TABLE IF NOT EXISTS candles (
 """
 
 TRADE_JSON_FIELDS = ("stop_loss_used", "indicators_used")
+ADDED_TRADE_COLUMNS = {"execution_mode": "TEXT NOT NULL DEFAULT 'auto'", "user_action": "TEXT"}
+USER_ACTIONS = ("placed", "ignored")
 
 
 def now_iso() -> str:
@@ -110,6 +114,10 @@ def init_db() -> None:
     with connect() as conn:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(SCHEMA)
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(trades)")}
+        for col, ddl in ADDED_TRADE_COLUMNS.items():  # databases created before these columns existed
+            if col not in cols:
+                conn.execute(f"ALTER TABLE trades ADD COLUMN {col} {ddl}")
 
 
 def _row(r: sqlite3.Row) -> dict:
@@ -199,6 +207,31 @@ def signal_already_logged(instrument: str, strategy: str, candle_time: str, mode
     return r is not None
 
 
+def manual_signals(mode: str, limit: int = 20) -> list[dict]:
+    """Latest advice produced in manual mode: suggested buys/sells and the signals to leave alone."""
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM trades WHERE execution_mode = 'manual' AND mode = ? ORDER BY id DESC LIMIT ?",
+            (mode, limit)).fetchall()
+    return [_row(r) for r in rows]
+
+
+def unlinked_suggestions(mode: str, since: str) -> list[dict]:
+    """Manual buy/sell suggestions not yet tied to an IG position and not ignored, newest first."""
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT * FROM trades WHERE mode = ? AND execution_mode = 'manual' AND status = 'suggested'
+               AND deal_id IS NULL AND COALESCE(user_action, '') != 'ignored' AND timestamp >= ?
+               ORDER BY timestamp DESC""", (mode, since)).fetchall()
+    return [_row(r) for r in rows]
+
+
+def known_deal_ids(mode: str) -> set[str]:
+    with connect() as conn:
+        rows = conn.execute("SELECT deal_id FROM trades WHERE mode = ? AND deal_id IS NOT NULL", (mode,)).fetchall()
+    return {r[0] for r in rows}
+
+
 def closed_trades(mode: Optional[str] = None, limit: int = 50) -> list[dict]:
     sql = "SELECT * FROM trades WHERE status = 'closed'"
     args: list = []
@@ -226,6 +259,12 @@ def pnl_summary(mode: str) -> dict:
             """SELECT indicator_suggested_direction s, claude_final_direction c, COUNT(*) n
                FROM trades WHERE mode = ? GROUP BY s, c""", (mode,)).fetchall()
         open_n = conn.execute("SELECT COUNT(*) FROM trades WHERE mode = ? AND status = 'open'", (mode,)).fetchone()[0]
+        follow = conn.execute(
+            """SELECT COALESCE(user_action, 'pending') action, COUNT(*) n,
+                      SUM(CASE WHEN status = 'closed' THEN profit_loss END) pnl,
+                      SUM(CASE WHEN status = 'closed' THEN 1 ELSE 0 END) closed
+               FROM trades WHERE mode = ? AND execution_mode = 'manual' AND claude_final_direction IN ('buy','sell')
+               AND status IN ('suggested','open','closed') GROUP BY action""", (mode,)).fetchall()
     n = tot["n"] or 0
     return {
         "mode": mode,
@@ -241,6 +280,10 @@ def pnl_summary(mode: str) -> dict:
             for r in by_strategy
         ],
         "decision_matrix": [dict(r) for r in decisions],
+        # How manual-mode buy/sell suggestions were acted on: placed / ignored / pending (no answer yet).
+        "manual_follow_through": {r["action"]: {"n": r["n"], "closed": r["closed"],
+                                                "pnl": round(r["pnl"], 2) if r["pnl"] is not None else None}
+                                  for r in follow},
     }
 
 

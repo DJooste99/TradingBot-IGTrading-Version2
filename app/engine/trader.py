@@ -1,5 +1,8 @@
 """Trading engine: candles -> strategy signal -> Claude decision -> risk manager -> IG order.
 
+In manual execution mode the pipeline stops before the order: the planned trade is
+logged as ``suggested`` (or the signal as a do-nothing) for the dashboard to show.
+
 Runs in a background thread. Config files are re-read every cycle so dashboard
 edits take effect without a restart; a change of ``active_mode`` rebuilds the
 IG client with the other environment's credentials.
@@ -15,8 +18,6 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-import anthropic
-
 from app import config, db
 from app.claude import monitor, service
 from app.engine.candles import TIMEFRAMES, CandleCache
@@ -29,6 +30,8 @@ from app.ig_limits import RateLimited, projected_weekly_points
 log = logging.getLogger(__name__)
 
 MARKET_CLOSED_RECHECK = timedelta(minutes=10)
+MANUAL_MATCH_WINDOW = timedelta(hours=24)  # how long a manual suggestion can be linked to a position placed on IG
+MANUAL_MATCH_SLACK = timedelta(minutes=1)  # clock skew allowance between our timestamps and IG's
 EXPECTED_REJECTIONS = {"MARKET_CLOSED", "MARKET_CLOSED_WITH_EDITS", "MARKET_OFFLINE"}
 REVIEW_INTERVALS = {"hourly": timedelta(hours=1), "daily": timedelta(days=1), "weekly": timedelta(weeks=1)}
 
@@ -59,8 +62,8 @@ class TradingEngine:
         self._misses: dict[tuple[str, str], int] = {}
         self._background = ThreadPoolExecutor(max_workers=2, thread_name_prefix="claude-review")
         self._review_running = threading.Lock()
-        self.state: dict = {"running": False, "mode": None, "last_cycle": None, "last_error": None,
-                            "instruments": {}}
+        self.state: dict = {"running": False, "mode": None, "execution_mode": None, "last_cycle": None,
+                            "last_error": None, "instruments": {}}
 
     # ------------------------------------------------------------ lifecycle
     def start(self) -> None:
@@ -112,6 +115,7 @@ class TradingEngine:
     def cycle(self) -> None:
         mode = config.active_mode()
         self.state["mode"] = mode
+        self.state["execution_mode"] = config.execution_mode()
         ig = self.ig()
         assets, indicators = config.load("asset"), config.load("indicator")
 
@@ -198,11 +202,12 @@ class TradingEngine:
             return 0
 
         claude_cfg = config.load("claude").decision_engine
+        execution = config.execution_mode()
         indicators_used = {"candle_time": signal.candle_time, "last_close": signal.price,
                            "rules": signal.rules, "values": signal.indicator_values}
         base = dict(mode=mode, instrument=signal.epic, asset_class=signal.asset_class,
                     strategy=signal.strategy_name, indicator_suggested_direction=signal.direction,
-                    indicators_used=indicators_used)
+                    indicators_used=indicators_used, execution_mode=execution)
 
         # 1. Claude decision (final say on direction / whether to trade)
         if claude_cfg.enabled and mode in claude_cfg.run_on:
@@ -210,7 +215,7 @@ class TradingEngine:
                 history = db.recent_history(signal.epic, signal.strategy_name, claude_cfg.trade_history_lookback)
                 name = (market.get("instrument") or {}).get("name", signal.epic)
                 decision = service.decide(signal, history, claude_cfg, name)
-            except (anthropic.APIError, service.ClaudeError) as e:
+            except service.ClaudeError as e:
                 monitor.report("api_error", f"Claude decision failed for {signal.epic}: {e}", e)
                 info["note"] = "Claude unavailable; trade not taken"
                 return db.insert_trade(**base, claude_final_direction="skipped", status="error",
@@ -242,6 +247,14 @@ class TradingEngine:
 
         db.update_trade(trade_id, size=plan.size, stop_loss_used=plan.stop_loss_used,
                         status_note=f"exposure {plan.exposure:.2f} {risk.currency}")
+
+        if execution == "manual":
+            # Advice only: the user decides whether to place it themselves. entry_price holds the quote used.
+            db.update_trade(trade_id, status="suggested", entry_price=plan.entry_price,
+                            status_note=f"manual mode, not executed; exposure {plan.exposure:.2f} {risk.currency}")
+            info["note"] = f"suggested {plan.direction} {plan.size} @ ~{plan.entry_price} (manual mode)"
+            log.info("Suggested trade #%s %s %s %s", trade_id, plan.direction, plan.size, signal.epic)
+            return trade_id
 
         # 3. Execute
         try:
@@ -277,10 +290,15 @@ class TradingEngine:
     # ------------------------------------------------------------ position lifecycle
     def sync_positions(self, mode: str) -> None:
         open_rows = db.open_trades(mode)
-        if not open_rows:
+        since = (datetime.now(timezone.utc) - MANUAL_MATCH_WINDOW).isoformat(timespec="seconds")
+        pending = db.unlinked_suggestions(mode, since)
+        if not open_rows and not pending:
             return
         ig = self.ig()
-        live_ids = {p["position"]["dealId"] for p in ig.get_positions()}
+        positions = ig.get_positions()
+        if pending:
+            self.link_manual_positions(mode, positions, pending)
+        live_ids = {p["position"]["dealId"] for p in positions}
         closed = [t for t in open_rows if t["deal_id"] and t["deal_id"] not in live_ids]
         if not closed:
             return
@@ -293,6 +311,36 @@ class TradingEngine:
             activities, transactions = [], []
         for trade in closed:
             self._record_close(ig, trade, activities, transactions)
+
+    def link_manual_positions(self, mode: str, positions: list[dict], pending: list[dict]) -> None:
+        """Tie positions the user opened on IG to the manual suggestion they followed.
+
+        A position matches the newest pending suggestion for the same instrument and direction made before it
+        was opened. Linked rows become ordinary open trades, so close tracking, P/L and reviews apply.
+        """
+        known = db.known_deal_ids(mode)
+        new = [p for p in positions if p["position"]["dealId"] not in known]
+        new.sort(key=lambda p: _created(p) or datetime.max.replace(tzinfo=timezone.utc))
+        taken: set[int] = set()
+        for p in new:
+            pos, epic = p["position"], (p.get("market") or {}).get("epic")
+            direction, created = str(pos.get("direction", "")).lower(), _created(p)
+            match = next((s for s in pending if s["id"] not in taken and s["instrument"] == epic
+                          and s["claude_final_direction"] == direction
+                          and (created is None
+                               or datetime.fromisoformat(s["timestamp"]) <= created + MANUAL_MATCH_SLACK)),
+                         None)
+            if match is None:
+                continue  # a trade of the user's own, not one we suggested
+            taken.add(match["id"])
+            # size/entry/stop now record the real fill; keep the original advice alongside for comparison
+            used = dict(match["stop_loss_used"] or {})
+            used.update(suggested_size=match["size"], suggested_price=match["entry_price"],
+                        suggested_stop_price=used.get("stop_price"), stop_price=pos.get("stopLevel"))
+            db.update_trade(match["id"], status="open", user_action="placed", deal_id=pos["dealId"],
+                            deal_reference=pos.get("dealReference"), entry_price=pos.get("level"),
+                            size=pos.get("size"), stop_loss_used=used, status_note="placed manually on IG")
+            log.info("Linked IG position %s to manual suggestion #%s", pos["dealId"], match["id"])
 
     def _record_close(self, ig, trade: dict, activities: list, transactions: list) -> None:
         exit_price, closed_at = None, None
@@ -388,7 +436,15 @@ class TradingEngine:
             self._review_running.release()
 
 
+def _created(p: dict) -> Optional[datetime]:
+    raw = (p.get("position") or {}).get("createdDateUTC")
+    try:
+        return datetime.fromisoformat(raw[:19]).replace(tzinfo=timezone.utc) if raw else None
+    except ValueError:
+        return None
+
+
 def _trigger_for(e: BaseException) -> str:
     if isinstance(e, RateLimited):
         return "api_error"
-    return "api_error" if isinstance(e, (IGError, anthropic.APIError, service.ClaudeError)) else "exception"
+    return "api_error" if isinstance(e, (IGError, service.ClaudeError)) else "exception"
